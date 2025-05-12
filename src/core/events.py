@@ -68,6 +68,20 @@ class EventType(Enum):
     UI_DOCUMENT_CLOSED = auto()
     UI_MESH_VIEW_CHANGED = auto()
     UI_SETTINGS_CHANGED = auto()
+    
+    THEME_CHANGED = auto()
+    THEME_CREATED = auto()
+    THEME_DELETED = auto()
+    
+    OFFICE365_CONNECTED = auto()
+    OFFICE365_DISCONNECTED = auto()
+    OFFICE365_DOCUMENT_SYNCED = auto()
+    OFFICE365_DOCUMENT_UPDATED = auto()
+    OFFICE365_DOCUMENT_DELETED = auto()
+    
+    IMAGE_GENERATION_REQUESTED = auto()
+    IMAGE_GENERATION_COMPLETED = auto()
+    IMAGE_GENERATION_FAILED = auto()
 
 
 class Event:
