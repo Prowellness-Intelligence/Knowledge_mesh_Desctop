@@ -9,6 +9,7 @@ import asyncio
 import logging
 import os
 import time
+import pickle
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple, Union, Any
@@ -30,7 +31,7 @@ from transformers import pipeline
 
 from ..core.config import Config
 from ..core.events import EventType, publish, subscribe, event_bus
-from ..models.document import Document, DocumentType, DocumentStatus
+from ..models.document import Document, DocumentType, DocumentStatus, DocumentChunk
 
 logger = logging.getLogger(__name__)
 
@@ -104,16 +105,33 @@ class DocumentProcessorService:
             nltk.download("stopwords", quiet=True)
             nltk.download("wordnet", quiet=True)
             
-            self.summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
-            logger.info("Summarization model loaded")
+            try:
+                self.summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
+                logger.info("Summarization model loaded")
+            except Exception as e:
+                logger.warning(f"Error loading summarization model: {e}")
+                self.summarizer = None
+            
+            data_dir = Path(self.config.get("app.data_dir", "."))
+            documents_dir = data_dir / "documents"
+            documents_dir.mkdir(parents=True, exist_ok=True)
+            
+            event_bus.subscribe(EventType.FILE_CREATED, self._on_file_created)
+            event_bus.subscribe(EventType.FILE_MODIFIED, self._on_file_modified)
+            
+            try:
+                from ..services.vector_store import VectorStoreService
+                self.vector_store_service = VectorStoreService(self.config)
+                await self.vector_store_service.initialize()
+                logger.info("Vector store service initialized")
+            except Exception as e:
+                logger.warning(f"Error initializing vector store service: {e}")
+                self.vector_store_service = None
+            
+            logger.info("Document processor service initialized")
         except Exception as e:
-            logger.warning(f"Error loading summarization model: {e}")
-            self.summarizer = None
-        
-        event_bus.subscribe(EventType.FILE_CREATED, self._on_file_created)
-        event_bus.subscribe(EventType.FILE_MODIFIED, self._on_file_modified)
-        
-        logger.info("Document processor service initialized")
+            logger.error(f"Error initializing document processor service: {e}", exc_info=True)
+            raise
     
     async def start(self):
         """Start the document processor service."""
@@ -582,7 +600,18 @@ class DocumentProcessorService:
         Args:
             document: The document to save
         """
-        logger.debug(f"Document saved: {document.id}")
+        try:
+            data_dir = Path(self.config.get("app.data_dir", "."))
+            documents_dir = data_dir / "documents"
+            documents_dir.mkdir(parents=True, exist_ok=True)
+            
+            document_path = documents_dir / f"{document.id}.pkl"
+            with open(document_path, "wb") as f:
+                pickle.dump(document.to_dict(), f)
+            
+            logger.info(f"Document saved: {document.id}")
+        except Exception as e:
+            logger.error(f"Error saving document {document.id}: {e}", exc_info=True)
     
     async def _index_document(self, document: Document):
         """
@@ -591,15 +620,82 @@ class DocumentProcessorService:
         Args:
             document: The document to index
         """
-        logger.debug(f"Document indexed: {document.id}")
+        try:
+            if document.content and len(document.content) > 1000:
+                await self._split_document_into_chunks(document)
+            
+            if self.vector_store_service:
+                await self.vector_store_service.index_document(document)
+                logger.info(f"Document indexed in vector store: {document.id}")
+            else:
+                logger.warning("Vector store service not available for indexing")
+            
+            publish(
+                EventType.DOCUMENT_INDEXED,
+                {
+                    "document_id": document.id,
+                    "path": document.file_path,
+                },
+            )
+        except Exception as e:
+            logger.error(f"Error indexing document {document.id}: {e}", exc_info=True)
+    
+    async def _split_document_into_chunks(self, document: Document):
+        """
+        Split a document into chunks for more effective processing and indexing.
         
-        publish(
-            EventType.DOCUMENT_INDEXED,
-            {
-                "document_id": document.id,
-                "path": document.file_path,
-            },
-        )
+        Args:
+            document: The document to split
+        """
+        try:
+            if not document.content:
+                return
+            
+            chunk_size = 1000
+            chunk_overlap = 200
+            
+            sentences = sent_tokenize(document.content)
+            
+            chunks = []
+            current_chunk = ""
+            current_chunk_size = 0
+            
+            for sentence in sentences:
+                if current_chunk_size + len(sentence) > chunk_size and current_chunk:
+                    chunk_id = f"{document.id}_chunk_{len(chunks)}"
+                    chunk = DocumentChunk(
+                        id=chunk_id,
+                        document_id=document.id,
+                        content=current_chunk,
+                        metadata={"chunk_index": len(chunks)},
+                        chunk_index=len(chunks),
+                    )
+                    chunks.append(chunk)
+                    
+                    overlap_start = max(0, len(current_chunk) - chunk_overlap)
+                    current_chunk = current_chunk[overlap_start:] + sentence
+                    current_chunk_size = len(current_chunk)
+                else:
+                    current_chunk += sentence
+                    current_chunk_size += len(sentence)
+            
+            if current_chunk:
+                chunk_id = f"{document.id}_chunk_{len(chunks)}"
+                chunk = DocumentChunk(
+                    id=chunk_id,
+                    document_id=document.id,
+                    content=current_chunk,
+                    metadata={"chunk_index": len(chunks)},
+                    chunk_index=len(chunks),
+                )
+                chunks.append(chunk)
+            
+            for chunk in chunks:
+                document.add_chunk(chunk)
+            
+            logger.info(f"Document split into {len(chunks)} chunks: {document.id}")
+        except Exception as e:
+            logger.error(f"Error splitting document {document.id} into chunks: {e}", exc_info=True)
     
     async def process_file(self, file_path: str):
         """
@@ -620,7 +716,23 @@ class DocumentProcessorService:
         Returns:
             The document, or None if not found
         """
-        return None
+        try:
+            data_dir = Path(self.config.get("app.data_dir", "."))
+            documents_dir = data_dir / "documents"
+            document_path = documents_dir / f"{document_id}.pkl"
+            
+            if not document_path.exists():
+                logger.warning(f"Document not found: {document_id}")
+                return None
+            
+            with open(document_path, "rb") as f:
+                document_dict = pickle.load(f)
+            
+            document = Document.from_dict(document_dict)
+            return document
+        except Exception as e:
+            logger.error(f"Error getting document {document_id}: {e}", exc_info=True)
+            return None
     
     async def search_documents(self, query: str) -> List[Document]:
         """
@@ -632,4 +744,40 @@ class DocumentProcessorService:
         Returns:
             A list of matching documents
         """
-        return []
+        try:
+            results = []
+            
+            if self.vector_store_service:
+                search_results = await self.vector_store_service.search(query)
+                
+                for document_id, similarity in search_results:
+                    document = await self.get_document(document_id)
+                    if document:
+                        results.append(document)
+            else:
+                logger.warning("Vector store service not available for search, using basic keyword search")
+                
+                # Get all documents
+                data_dir = Path(self.config.get("app.data_dir", "."))
+                documents_dir = data_dir / "documents"
+                
+                if not documents_dir.exists():
+                    return []
+                
+                for document_path in documents_dir.glob("*.pkl"):
+                    try:
+                        with open(document_path, "rb") as f:
+                            document_dict = pickle.load(f)
+                        
+                        document = Document.from_dict(document_dict)
+                        
+                        if (document.content and query.lower() in document.content.lower()) or \
+                           (document.title and query.lower() in document.title.lower()):
+                            results.append(document)
+                    except Exception as e:
+                        logger.error(f"Error searching document {document_path}: {e}", exc_info=True)
+            
+            return results
+        except Exception as e:
+            logger.error(f"Error searching documents: {e}", exc_info=True)
+            return []
