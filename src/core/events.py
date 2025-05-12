@@ -295,7 +295,7 @@ def publish(event_type: EventType, data: Any = None, source: Optional[str] = Non
             module = inspect.getmodule(frame)
             source = module.__name__ if module else "unknown"
         else:
-ho            source = "unknown"
+            source = "unknown"
 
     event = Event(event_type, data, source)
     event_bus.publish(event)

@@ -11,7 +11,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import Dict, List, Optional, Set, Tuple, Union, Callable, Any
 
 from watchdog.observers import Observer
 from watchdog.events import (
@@ -26,7 +26,7 @@ from watchdog.events import (
 )
 
 from ..core.config import Config
-from ..core.events import EventType, publish, subscribe, event_bus
+from ..core.events import EventType, Event, publish, subscribe, event_bus
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +48,7 @@ class FileEventHandler(FileSystemEventHandler):
         """
         self.service = service
         self.ignore_patterns = service.ignore_patterns
-        self.monitored_extensions = service.monitored_extensions
+        self.extensions = service.extensions
     
     def _should_ignore(self, path: Union[str, bytes]) -> bool:
         """
@@ -69,7 +69,7 @@ class FileEventHandler(FileSystemEventHandler):
         
         if os.path.isfile(path):
             _, ext = os.path.splitext(path)
-            if self.monitored_extensions and ext.lower() not in self.monitored_extensions:
+            if self.extensions and ext.lower() not in self.extensions:
                 return True
         
         return False
@@ -87,6 +87,9 @@ class FileEventHandler(FileSystemEventHandler):
         if isinstance(event, FileCreatedEvent):
             logger.debug(f"File created: {event.src_path}")
             publish(EventType.FILE_CREATED, {"path": event.src_path})
+            
+            asyncio.create_task(self.service._process_file(event.src_path))
+            
         elif isinstance(event, DirCreatedEvent):
             logger.debug(f"Directory created: {event.src_path}")
             publish(EventType.DIRECTORY_CREATED, {"path": event.src_path})
@@ -104,6 +107,8 @@ class FileEventHandler(FileSystemEventHandler):
         if isinstance(event, FileModifiedEvent):
             logger.debug(f"File modified: {event.src_path}")
             publish(EventType.FILE_MODIFIED, {"path": event.src_path})
+            
+            asyncio.create_task(self.service._process_file(event.src_path))
     
     def on_deleted(self, event: FileSystemEvent):
         """
@@ -135,6 +140,8 @@ class FileEventHandler(FileSystemEventHandler):
         if isinstance(event, FileMovedEvent):
             logger.debug(f"File moved: {event.src_path} -> {event.dest_path}")
             publish(EventType.FILE_MOVED, {"src_path": event.src_path, "dest_path": event.dest_path})
+            
+            asyncio.create_task(self.service._process_file(event.dest_path))
 
 
 class FileMonitorService:
@@ -155,19 +162,23 @@ class FileMonitorService:
         """
         self.config = config
         self.observer = None
-        self.event_handler = FileEventHandler(self)
-        self.monitored_directories = []
-        self.monitored_extensions = []
+        self.directories = []
+        self.extensions = []
         self.ignore_patterns = []
-        self.scan_interval = 60  # Default scan interval in seconds
+        self.polling_interval = 1  # Default polling interval in seconds
         self.is_running = False
         self.scan_task = None
+        self.enabled = True
+        self.recursive = True
+        self.watched_paths = set()
+        self.file_handlers = {}
         
         self._load_config()
+        self.event_handler = FileEventHandler(self)
     
     def _load_config(self):
         """Load configuration from the config object."""
-        self.monitored_directories = [
+        self.directories = [
             os.path.expanduser(d)
             for d in self.config.get("file_monitor.directories", ["~/Documents"])
         ]
@@ -176,28 +187,22 @@ class FileMonitorService:
             "file_monitor.extensions",
             [".pdf", ".docx", ".doc", ".txt", ".md", ".pptx", ".xlsx", ".csv"]
         )
-        self.monitored_extensions = [ext.lower() for ext in extensions]
+        self.extensions = [ext.lower() for ext in extensions]
         
         self.ignore_patterns = self.config.get(
             "file_monitor.ignore_patterns",
-            ["~$", ".", ".tmp", ".temp", ".git", "__pycache__", ".DS_Store"]
+            [".*", "~*", ".tmp", ".temp", ".git", "__pycache__", ".DS_Store"]
         )
         
-        self.scan_interval = self.config.get("file_monitor.scan_interval_seconds", 60)
+        self.polling_interval = self.config.get("file_monitor.polling_interval", 1)
+        self.recursive = self.config.get("file_monitor.recursive", True)
+        self.enabled = self.config.get("file_monitor.enabled", True)
     
     async def initialize(self):
         """Initialize the file monitor service."""
         logger.info("Initializing file monitor service")
         
-        self.observer = Observer()
-        
-        for directory in self.monitored_directories:
-            path = Path(directory)
-            if path.exists() and path.is_dir():
-                logger.info(f"Scheduling directory for monitoring: {directory}")
-                self.observer.schedule(self.event_handler, directory, recursive=True)
-            else:
-                logger.warning(f"Directory does not exist or is not a directory: {directory}")
+        event_bus.subscribe(EventType.APP_CONFIGURATION_CHANGED, self._on_config_changed)
         
         logger.info("File monitor service initialized")
     
@@ -207,15 +212,28 @@ class FileMonitorService:
             logger.warning("File monitor service is already running")
             return
         
+        if not self.enabled:
+            logger.info("File monitor service is disabled")
+            return
+        
         logger.info("Starting file monitor service")
         
-        if self.observer:
-            self.observer.start()
-        else:
-            logger.warning("Observer is not initialized")
-            self.observer = Observer()
-            self.observer.start()
+        self.observer = Observer()
         
+        for directory in self.directories:
+            path = Path(directory)
+            if path.exists() and path.is_dir():
+                logger.info(f"Scheduling directory for monitoring: {directory}")
+                watch = self.observer.schedule(
+                    self.event_handler, 
+                    directory, 
+                    recursive=self.recursive
+                )
+                self.watched_paths.add(directory)
+            else:
+                logger.warning(f"Directory does not exist or is not a directory: {directory}")
+        
+        self.observer.start()
         self.is_running = True
         
         self.scan_task = asyncio.create_task(self._periodic_scan())
@@ -233,8 +251,6 @@ class FileMonitorService:
         if self.observer:
             self.observer.stop()
             self.observer.join()
-        else:
-            logger.warning("Observer is not initialized")
         
         if self.scan_task:
             self.scan_task.cancel()
@@ -244,14 +260,66 @@ class FileMonitorService:
                 pass
         
         self.is_running = False
+        self.watched_paths.clear()
         
         logger.info("File monitor service stopped")
+    
+    async def restart(self):
+        """Restart the file monitor service."""
+        logger.info("Restarting file monitor service")
+        
+        if self.is_running:
+            await self.stop()
+        
+        await self.start()
+    
+    def _on_config_changed(self, event: Event):
+        """
+        Handle configuration changes.
+        
+        Args:
+            event: The configuration changed event
+        """
+        if not event.data or "settings" not in event.data:
+            return
+        
+        settings = event.data["settings"]
+        config_changed = False
+        
+        if "file_monitor.directories" in settings:
+            self.directories = [
+                os.path.expanduser(d) for d in settings["file_monitor.directories"]
+            ]
+            config_changed = True
+        
+        if "file_monitor.extensions" in settings:
+            self.extensions = [ext.lower() for ext in settings["file_monitor.extensions"]]
+            config_changed = True
+        
+        if "file_monitor.ignore_patterns" in settings:
+            self.ignore_patterns = settings["file_monitor.ignore_patterns"]
+            config_changed = True
+        
+        if "file_monitor.recursive" in settings:
+            self.recursive = settings["file_monitor.recursive"]
+            config_changed = True
+        
+        if "file_monitor.polling_interval" in settings:
+            self.polling_interval = settings["file_monitor.polling_interval"]
+            config_changed = True
+        
+        if "file_monitor.enabled" in settings:
+            self.enabled = settings["file_monitor.enabled"]
+            config_changed = True
+        
+        if config_changed:
+            asyncio.create_task(self.restart())
     
     async def _periodic_scan(self):
         """Periodically scan monitored directories for changes."""
         while self.is_running:
             try:
-                await asyncio.sleep(self.scan_interval)
+                await asyncio.sleep(self.polling_interval)
                 
                 await self._scan_directories()
             except asyncio.CancelledError:
@@ -263,7 +331,7 @@ class FileMonitorService:
         """Scan monitored directories for changes."""
         logger.debug("Scanning directories for changes")
         
-        for directory in self.monitored_directories:
+        for directory in self.directories:
             path = Path(directory)
             if path.exists() and path.is_dir():
                 await self._scan_directory(path)
@@ -282,9 +350,25 @@ class FileMonitorService:
                 for file in files:
                     file_path = os.path.join(root, file)
                     if not self._should_ignore(file_path):
-                        pass
+                        await self._process_file(file_path)
         except Exception as e:
             logger.error(f"Error scanning directory {directory}: {e}", exc_info=True)
+    
+    async def _process_file(self, file_path: str):
+        """
+        Process a file with registered handlers.
+        
+        Args:
+            file_path: The path to the file to process
+        """
+        _, ext = os.path.splitext(file_path)
+        ext = ext.lower()
+        
+        if ext in self.file_handlers:
+            try:
+                await self.file_handlers[ext](file_path)
+            except Exception as e:
+                logger.error(f"Error processing file {file_path}: {e}", exc_info=True)
     
     def _should_ignore(self, path: Union[str, bytes]) -> bool:
         """
@@ -305,12 +389,36 @@ class FileMonitorService:
         
         if os.path.isfile(path):
             _, ext = os.path.splitext(path)
-            if self.monitored_extensions and ext.lower() not in self.monitored_extensions:
+            if self.extensions and ext.lower() not in self.extensions:
                 return True
         
         return False
     
-    def add_monitored_directory(self, directory: str):
+    def register_handler(self, extension: str, handler: Callable[[str], Any]):
+        """
+        Register a handler for a specific file extension.
+        
+        Args:
+            extension: The file extension to handle (e.g., ".pdf")
+            handler: The handler function to call for files with this extension
+        """
+        extension = extension.lower()
+        logger.info(f"Registering handler for extension: {extension}")
+        self.file_handlers[extension] = handler
+    
+    def unregister_handler(self, extension: str):
+        """
+        Unregister a handler for a specific file extension.
+        
+        Args:
+            extension: The file extension to stop handling (e.g., ".pdf")
+        """
+        extension = extension.lower()
+        if extension in self.file_handlers:
+            logger.info(f"Unregistering handler for extension: {extension}")
+            del self.file_handlers[extension]
+    
+    def add_directory(self, directory: str):
         """
         Add a directory to the list of monitored directories.
         
@@ -318,18 +426,23 @@ class FileMonitorService:
             directory: The directory to monitor
         """
         directory = os.path.expanduser(directory)
-        if directory not in self.monitored_directories:
+        if directory not in self.directories:
             logger.info(f"Adding monitored directory: {directory}")
-            self.monitored_directories.append(directory)
+            self.directories.append(directory)
             
             if self.observer and self.observer.is_alive():
                 path = Path(directory)
                 if path.exists() and path.is_dir():
-                    self.observer.schedule(self.event_handler, directory, recursive=True)
+                    watch = self.observer.schedule(
+                        self.event_handler, 
+                        directory, 
+                        recursive=self.recursive
+                    )
+                    self.watched_paths.add(directory)
                 else:
                     logger.warning(f"Directory does not exist or is not a directory: {directory}")
     
-    def remove_monitored_directory(self, directory: str):
+    def remove_directory(self, directory: str):
         """
         Remove a directory from the list of monitored directories.
         
@@ -337,18 +450,20 @@ class FileMonitorService:
             directory: The directory to stop monitoring
         """
         directory = os.path.expanduser(directory)
-        if directory in self.monitored_directories:
+        if directory in self.directories:
             logger.info(f"Removing monitored directory: {directory}")
-            self.monitored_directories.remove(directory)
+            self.directories.remove(directory)
             
             if self.observer and self.observer.is_alive():
-                watches = list(self.observer._watches)
-                
-                for watch in watches:
-                    if str(watch).startswith(directory):
+                for watch in list(self.observer._watches.keys()):
+                    watch_path = self.observer._watches[watch][0].path
+                    if watch_path.startswith(directory):
                         self.observer.unschedule(watch)
+                
+                if directory in self.watched_paths:
+                    self.watched_paths.remove(directory)
     
-    def add_monitored_extension(self, extension: str):
+    def add_extension(self, extension: str):
         """
         Add a file extension to the list of monitored extensions.
         
@@ -356,11 +471,11 @@ class FileMonitorService:
             extension: The file extension to monitor (e.g., ".pdf")
         """
         extension = extension.lower()
-        if extension not in self.monitored_extensions:
+        if extension not in self.extensions:
             logger.info(f"Adding monitored extension: {extension}")
-            self.monitored_extensions.append(extension)
+            self.extensions.append(extension)
     
-    def remove_monitored_extension(self, extension: str):
+    def remove_extension(self, extension: str):
         """
         Remove a file extension from the list of monitored extensions.
         
@@ -368,9 +483,9 @@ class FileMonitorService:
             extension: The file extension to stop monitoring (e.g., ".pdf")
         """
         extension = extension.lower()
-        if extension in self.monitored_extensions:
+        if extension in self.extensions:
             logger.info(f"Removing monitored extension: {extension}")
-            self.monitored_extensions.remove(extension)
+            self.extensions.remove(extension)
     
     def add_ignore_pattern(self, pattern: str):
         """
@@ -394,15 +509,15 @@ class FileMonitorService:
             logger.info(f"Removing ignore pattern: {pattern}")
             self.ignore_patterns.remove(pattern)
     
-    def set_scan_interval(self, interval: int):
+    def set_polling_interval(self, interval: int):
         """
-        Set the scan interval.
+        Set the polling interval.
         
         Args:
-            interval: The scan interval in seconds
+            interval: The polling interval in seconds
         """
         if interval > 0:
-            logger.info(f"Setting scan interval to {interval} seconds")
-            self.scan_interval = interval
+            logger.info(f"Setting polling interval to {interval} seconds")
+            self.polling_interval = interval
         else:
-            logger.warning(f"Invalid scan interval: {interval}")
+            logger.warning(f"Invalid polling interval: {interval}")
