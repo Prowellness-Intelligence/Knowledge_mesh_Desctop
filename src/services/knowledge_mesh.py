@@ -9,6 +9,7 @@ across different documents.
 import asyncio
 import logging
 import os
+import pickle
 import time
 from datetime import datetime
 from pathlib import Path
@@ -188,13 +189,11 @@ class KnowledgeMeshService:
         Returns:
             The document, or None if not found
         """
-        return Document(
-            id=document_id,
-            title=f"Document {document_id}",
-            content="Sample content",
-            embedding=np.random.rand(768),
-            metadata={},
-        )
+        if self.document_processor_service:
+            return await self.document_processor_service.get_document(document_id)
+        
+        logger.warning(f"Document processor service not available, cannot get document {document_id}")
+        return None
     
     async def _get_candidate_documents(self, document: Document) -> List[Document]:
         """
@@ -206,16 +205,24 @@ class KnowledgeMeshService:
         Returns:
             A list of candidate documents
         """
-        return [
-            Document(
-                id=f"doc_{i}",
-                title=f"Document {i}",
-                content=f"Sample content {i}",
-                embedding=np.random.rand(768),
-                metadata={},
-            )
-            for i in range(5)
-        ]
+        candidates = []
+        
+        # Use vector store to find semantically similar documents
+        if self.vector_store_service and document.content:
+            search_results = await self.vector_store_service.search(document.content)
+            
+            for doc_id, similarity in search_results:
+                if doc_id != document.id:  # Skip the document itself
+                    candidate = await self._get_document(doc_id)
+                    if candidate:
+                        candidates.append(candidate)
+        
+        # If we don't have enough candidates, get some recent documents
+        if len(candidates) < self.max_relationships_per_document and self.document_processor_service:
+            # This would typically query a database for recent documents
+            pass
+        
+        return candidates
     
     async def _detect_relationship(
         self, document: Document, candidate: Document
@@ -262,11 +269,28 @@ class KnowledgeMeshService:
             document: The source document
             relationships: The relationships to save
         """
-        for relationship in relationships:
-            logger.debug(
-                f"Relationship: {relationship.source_id} -> {relationship.target_id} "
-                f"({relationship.type.name}, {relationship.strength:.2f})"
-            )
+        try:
+            data_dir = Path(self.config.get("app.data_dir", "."))
+            relationships_dir = data_dir / "relationships"
+            relationships_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Save relationships for the document
+            relationship_path = relationships_dir / f"{document.id}.pkl"
+            
+            relationship_dicts = [r.to_dict() for r in relationships]
+            
+            with open(relationship_path, "wb") as f:
+                pickle.dump(relationship_dicts, f)
+            
+            for relationship in relationships:
+                logger.debug(
+                    f"Relationship: {relationship.source_id} -> {relationship.target_id} "
+                    f"({relationship.type.name}, {relationship.strength:.2f})"
+                )
+            
+            logger.info(f"Saved {len(relationships)} relationships for document {document.id}")
+        except Exception as e:
+            logger.error(f"Error saving relationships for document {document.id}: {e}", exc_info=True)
     
     async def _detect_semantic_similarity(
         self, document: Document, candidate: Document
@@ -447,17 +471,38 @@ class KnowledgeMeshService:
         
         return similarity / max_similarity
     
-    async def get_document_relationships(self, document_id: str) -> List[Relationship]:
+    async def get_document_relationships(self, document_id: str, relationship_types: Optional[List[RelationshipType]] = None) -> List[Relationship]:
         """
         Get relationships for a document.
         
         Args:
             document_id: The ID of the document
+            relationship_types: Optional list of relationship types to filter by
             
         Returns:
             A list of relationships
         """
-        return []
+        try:
+            data_dir = Path(self.config.get("app.data_dir", "."))
+            relationships_dir = data_dir / "relationships"
+            relationship_path = relationships_dir / f"{document_id}.pkl"
+            
+            if not relationship_path.exists():
+                logger.debug(f"No relationships found for document {document_id}")
+                return []
+            
+            with open(relationship_path, "rb") as f:
+                relationship_dicts = pickle.load(f)
+            
+            relationships = [Relationship.from_dict(r_dict) for r_dict in relationship_dicts]
+            
+            if relationship_types:
+                relationships = [r for r in relationships if r.type in relationship_types]
+            
+            return relationships
+        except Exception as e:
+            logger.error(f"Error getting relationships for document {document_id}: {e}", exc_info=True)
+            return []
     
     async def get_related_documents(
         self, document_id: str, relationship_types: Optional[List[RelationshipType]] = None
@@ -472,11 +517,53 @@ class KnowledgeMeshService:
         Returns:
             A list of related documents
         """
-        return []
+        try:
+            # Get relationships for the document
+            relationships = await self.get_document_relationships(document_id, relationship_types)
+            
+            if not relationships:
+                return []
+            
+            # Get related document IDs
+            related_doc_ids = [r.target_id for r in relationships]
+            
+            # Get related documents
+            related_docs = []
+            for doc_id in related_doc_ids:
+                doc = await self._get_document(doc_id)
+                if doc:
+                    related_docs.append(doc)
+            
+            return related_docs
+        except Exception as e:
+            logger.error(f"Error getting related documents for {document_id}: {e}", exc_info=True)
+            return []
     
     async def rebuild_mesh(self):
         """Rebuild the entire knowledge mesh."""
         logger.info("Rebuilding knowledge mesh")
         
-        
-        logger.info("Knowledge mesh rebuilt")
+        try:
+            # Get all documents
+            if self.document_processor_service:
+                # This would typically query a database for all documents
+                data_dir = Path(self.config.get("app.data_dir", "."))
+                documents_dir = data_dir / "documents"
+                
+                if not documents_dir.exists():
+                    logger.warning("Documents directory not found, cannot rebuild mesh")
+                    return
+                
+                for document_path in documents_dir.glob("*.pkl"):
+                    try:
+                        document_id = document_path.stem
+                        await self._analyze_document_relationships(document_id)
+                        logger.info(f"Processed relationships for document {document_id}")
+                    except Exception as e:
+                        logger.error(f"Error processing document {document_path}: {e}", exc_info=True)
+            else:
+                logger.warning("Document processor service not available, cannot rebuild mesh")
+            
+            logger.info("Knowledge mesh rebuilt")
+        except Exception as e:
+            logger.error(f"Error rebuilding knowledge mesh: {e}", exc_info=True)
